@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: |
+          cp .env.example .env
+          sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/; s/^MINIO_WEBHOOK_TOKEN=.*/MINIO_WEBHOOK_TOKEN=$(openssl rand -hex 32)/" .env
+
+      - name: Start infrastructure and API (migrations run on startup)
+        run: docker compose up -d --build postgres redis minio minio-init api
+
+      - name: Wait for the API
+        run: curl --fail --retry 40 --retry-connrefused --retry-delay 3 http://localhost:8000/health
+
+      - name: API tests
+        run: docker compose exec -T api pytest -v
+
+      - name: Worker tests
+        run: docker compose run --rm --no-deps worker pytest -v
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

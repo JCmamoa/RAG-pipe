@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAG Platform</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2230; --muted:#6b7385; --line:#e3e6ec; --accent:#2f5bea; --ok:#1a8f4c; --err:#c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171f; --card:#1c212c; --text:#e8ebf2; --muted:#98a0b3; --line:#2b3242; --accent:#6c8cff; --ok:#46c27e; --err:#ff7b6b; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; justify-content:space-between; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--card); }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:16px; padding:16px; max-width:1200px; margin:0 auto; height:calc(100vh - 58px); }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; height:auto; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; display:flex; flex-direction:column; min-height:0; }
+  h2 { margin:0 0 10px; font-size:15px; }
+  input, button { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  button { cursor:pointer; background:var(--accent); color:#fff; border:0; }
+  button.secondary { background:transparent; color:var(--text); border:1px solid var(--line); }
+  #auth { max-width:360px; margin:60px auto; gap:8px; }
+  #auth input { width:100%; margin-bottom:8px; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  #docs { overflow:auto; flex:1; margin-top:10px; }
+  .doc { padding:8px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:8px; font-size:13px; }
+  .doc small { color:var(--muted); display:block; }
+  .st-ready { color:var(--ok); } .st-failed { color:var(--err); } .st-queued,.st-processing,.st-pending { color:var(--muted); }
+  #log { flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; margin-bottom:10px; }
+  .msg { padding:10px 12px; border-radius:10px; max-width:85%; white-space:pre-wrap; word-wrap:break-word; }
+  .user { align-self:flex-end; background:var(--accent); color:#fff; }
+  .bot { align-self:flex-start; background:var(--bg); border:1px solid var(--line); }
+  .src { font-size:12px; color:var(--muted); margin-top:8px; border-top:1px dashed var(--line); padding-top:6px; }
+  .err { color:var(--err); font-size:13px; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<header><strong>RAG Platform</strong><span id="who" class="hidden"><span id="whoText"></span> <button class="secondary" id="logout">Sair</button></span></header>
+
+<section id="auth" class="card">
+  <h2>Entrar</h2>
+  <input id="email" type="email" placeholder="e-mail" autocomplete="username">
+  <input id="password" type="password" placeholder="senha (mín. 8)" autocomplete="current-password">
+  <input id="org" placeholder="Nome da organização (só para criar)">
+  <div class="row"><button id="login">Entrar</button><button id="register" class="secondary">Criar organização</button></div>
+  <div id="authErr" class="err"></div>
+</section>
+
+<main id="app" class="hidden">
+  <div class="card">
+    <h2>Documentos</h2>
+    <input id="file" type="file" accept="application/pdf">
+    <div id="uploadMsg" class="err"></div>
+    <div id="docs"></div>
+  </div>
+  <div class="card">
+    <h2>Chat</h2>
+    <div id="log"></div>
+    <div class="row"><input id="q" placeholder="Pergunte algo sobre os documentos…" style="flex:5"><button id="send">Enviar</button></div>
+  </div>
+</main>
+
+<script>
+let token = sessionStorage.getItem("token");
+let ws = null, wsReady = false, current = null, pollTimer = null;
+const $ = (id) => document.getElementById(id);
+
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (token) headers.Authorization = "Bearer " + token;
+  return fetch(path, { ...opts, headers });
+}
+
+// ---------- auth
+async function auth(kind) {
+  $("authErr").textContent = "";
+  const email = $("email").value.trim(), password = $("password").value;
+  let r;
+  if (kind === "login") {
+    r = await fetch("/auth/login", { method: "POST", body: new URLSearchParams({ username: email, password }) });
+  } else {
+    r = await fetch("/auth/register", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ org_name: $("org").value.trim(), email, password }) });
+  }
+  if (!r.ok) { $("authErr").textContent = r.status === 429 ? "Muitas tentativas. Aguarde um minuto." : "Falha: confira os dados."; return; }
+  token = (await r.json()).access_token;
+  sessionStorage.setItem("token", token);
+  start();
+}
+$("login").onclick = () => auth("login");
+$("register").onclick = () => auth("register");
+$("logout").onclick = () => { sessionStorage.removeItem("token"); token = null; if (ws) ws.close(); location.reload(); };
+
+async function start() {
+  const r = await api("/auth/me");
+  if (!r.ok) { sessionStorage.removeItem("token"); token = null; return; }
+  const me = await r.json();
+  $("whoText").textContent = me.email + " (" + me.role + ")";
+  $("who").classList.remove("hidden"); $("auth").classList.add("hidden"); $("app").classList.remove("hidden");
+  refreshDocs(); connect();
+}
+
+// ---------- documentos
+async function refreshDocs() {
+  const r = await api("/documents");
+  if (!r.ok) return;
+  const docs = await r.json();
+  $("docs").innerHTML = "";
+  for (const d of docs) {
+    const el = document.createElement("div"); el.className = "doc";
+    const left = document.createElement("div"); left.textContent = d.filename;
+    const meta = document.createElement("small"); meta.textContent = d.error || (d.page_count ? d.page_count + " págs" : ""); left.appendChild(meta);
+    const st = document.createElement("span"); st.className = "st-" + d.status; st.textContent = d.status;
+    el.append(left, st); $("docs").appendChild(el);
+  }
+  clearTimeout(pollTimer);
+  if (docs.some(d => ["pending", "queued", "processing"].includes(d.status))) pollTimer = setTimeout(refreshDocs, 3000);
+}
+
+$("file").onchange = async (e) => {
+  const file = e.target.files[0]; if (!file) return;
+  $("uploadMsg").textContent = "";
+  const r = await api("/documents", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ filename: file.name, size_bytes: file.size }) });
+  if (!r.ok) { $("uploadMsg").textContent = (await r.json()).detail || "Falha ao iniciar upload"; return; }
+  const t = await r.json();
+  const fd = new FormData();
+  Object.entries(t.upload.fields).forEach(([k, v]) => fd.append(k, v));
+  fd.append("file", file);  // o arquivo precisa ser o ÚLTIMO campo
+  const up = await fetch(t.upload.url, { method: "POST", body: fd });  // direto no MinIO
+  if (!up.ok) { $("uploadMsg").textContent = "Falha no envio ao storage (" + up.status + ")"; return; }
+  e.target.value = ""; refreshDocs();
+};
+
+// ---------- chat
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/chat");
+  ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token }));
+  ws.onmessage = (ev) => handle(JSON.parse(ev.data));
+  ws.onclose = (ev) => { wsReady = false; if (ev.code === 4401) addBot("Sessão expirada. Entre novamente.", true); };
+}
+
+function addMsg(text, cls) { const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text; $("log").appendChild(d); $("log").scrollTop = 1e9; return d; }
+function addBot(text, isErr) { const d = addMsg(text, "bot"); if (isErr) d.classList.add("err"); return d; }
+
+function handle(m) {
+  if (m.type === "ready") { wsReady = true; return; }
+  if (m.type === "sources") { current.sources = m.sources; return; }
+  if (m.type === "token") { current.text += m.text; current.el.firstChild.textContent = current.text; $("log").scrollTop = 1e9; return; }
+  if (m.type === "done") {
+    if (current.sources && current.sources.length) {
+      const s = document.createElement("div"); s.className = "src";
+      s.textContent = current.sources.map(x => `[${x.n}] ${x.filename}${x.page ? ", p. " + x.page : ""}`).join("\n");
+      current.el.appendChild(s);
+    }
+    current = null; return;
+  }
+  if (m.type === "error") {
+    if (m.code === "token_expired") { addBot("Token expirado. Entre novamente.", true); return; }
+    if (current) { current.el.firstChild.textContent = m.message; current = null; } else addBot(m.message, true);
+  }
+}
+
+function send() {
+  const text = $("q").value.trim();
+  if (!text || !wsReady || current) return;
+  addMsg(text, "user"); $("q").value = "";
+  const el = addMsg("", "bot");
+  el.textContent = "";
+  el.appendChild(document.createTextNode(""));  // firstChild recebe os tokens; as fontes entram depois
+  current = { el, text: "", sources: null };
+  ws.send(JSON.stringify({ type: "question", text }));
+}
+$("send").onclick = send;
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+
+if (token) start();
+</script>
+</body>
+</html>
