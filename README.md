@@ -138,3 +138,4 @@ docs/        ARCHITECTURE.md, STATUS.md
 - **Hot reload does not pick up changes on Windows** — add `WATCHFILES_FORCE_POLLING: "true"` to the `api` service.
 - **`\r` errors in `db/init/01-app-role.sh`** — the file must use LF line endings (`.gitattributes` enforces this).
 - **PowerShell blocks `smoke.ps1`** — `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+# Rag-platform
